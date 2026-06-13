@@ -514,18 +514,24 @@
 </div>
 
 <div class="footer-hint">
-  Daten: <a href="https://www.mvv-muenchen.de" target="_blank">MVV München</a> · Auto-Refresh alle 30s
+  Daten: <a href="https://www.mvg.de" target="_blank">MVG München</a> · Auto-Refresh alle 30s
 </div>
 
 <script>
-const API = 'https://www.mvv-muenchen.de';
-const ICON_BASE = 'https://www.mvv-muenchen.de/fileadmin/lines/';
+const API = 'https://www.mvg.de/api/bgw-pt/v3';
+
+// Escape user/API-provided text before injecting into HTML
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
 
 let currentStop = null;   // { id, name }
 let departures = [];
 let activeFilter = 'all';
 let refreshTimer = null;
 let searchTimer = null;
+let loadToken = 0;        // guards against stale (overlapping) departure responses
 
 // --- Favorites ---
 function getFavorites() {
@@ -615,11 +621,17 @@ document.addEventListener('click', function(e) {
 
 async function searchStops(query) {
   try {
-    const res = await fetch(`${API}/?eID=stopFinder&query=${encodeURIComponent(query)}`);
+    const res = await fetch(`${API}/locations?query=${encodeURIComponent(query)}`);
     const data = await res.json();
-    if (data.success && data.results) {
-      showAutocomplete(data.results.filter(r => r.anyType === 'stop').slice(0, 8));
-    }
+    const stops = (Array.isArray(data) ? data : [])
+      .filter(r => r.type === 'STATION')
+      .map(r => ({
+        id: r.globalId,
+        name: r.place ? `${r.place}, ${r.name}` : r.name,
+        anyType: 'stop'
+      }))
+      .slice(0, 8);
+    showAutocomplete(stops);
   } catch (err) {
     console.error('Search error:', err);
   }
@@ -688,21 +700,21 @@ function selectStop(id, name) {
 async function loadDepartures() {
   if (!currentStop) return;
 
+  const token = ++loadToken;
+  const stopId = currentStop.id;
   showLoading();
   try {
-    const ts = Math.floor(Date.now() / 1000);
     const res = await fetch(
-      `${API}/?eID=departuresFinder&action=get_departures&stop_id=${encodeURIComponent(currentStop.id)}&requested_timestamp=${ts}&lines=`
+      `${API}/departures?globalId=${encodeURIComponent(stopId)}&limit=40`
     );
     const data = await res.json();
 
-    if (data.error) {
-      console.warn('API error:', data.error);
-    }
+    // Ignore stale responses: a newer load (e.g. station switch) started meanwhile.
+    if (token !== loadToken || !currentStop || currentStop.id !== stopId) return;
 
-    departures = data.departures || [];
+    departures = (Array.isArray(data) ? data : []).map(normalizeDeparture);
     renderDepartures();
-    renderNotifications(data.departures || []);
+    renderNotifications(departures);
     renderFilterTabs();
 
     const now = new Date();
@@ -710,17 +722,40 @@ async function loadDepartures() {
       `Aktualisiert ${now.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
 
   } catch (err) {
+    if (token !== loadToken) return;
     console.error('Load error:', err);
     document.getElementById('depList').innerHTML =
       '<div class="empty-state"><div class="icon">⚠️</div><p>Fehler beim Laden</p></div>';
+  } finally {
+    if (token === loadToken) {
+      hideLoading();
+      scheduleRefresh();
+    }
   }
-  hideLoading();
-  scheduleRefresh();
 }
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => loadDepartures(), 30000);
+}
+
+// --- Normalize MVG departure ---
+function normalizeDeparture(m) {
+  return {
+    type: m.transportType || '',
+    label: m.label || '',
+    destination: m.destination || '',
+    planned: m.plannedDepartureTime,
+    live: m.realtimeDepartureTime || m.plannedDepartureTime,
+    realtime: !!m.realtime,
+    delay: m.delayInMinutes || 0,
+    cancelled: !!m.cancelled,
+    platform: (m.platform != null && m.platform !== 0) ? m.platform : '',
+    messages: [
+      ...(m.messages || []),
+      ...((m.infos || []).map(i => i && i.message).filter(Boolean))
+    ]
+  };
 }
 
 // --- Render Departures ---
@@ -729,36 +764,33 @@ function renderDepartures() {
   let filtered = departures;
 
   if (activeFilter !== 'all') {
-    filtered = departures.filter(d => classifyLine(d.line.name) === activeFilter);
+    filtered = departures.filter(d => classifyType(d.type) === activeFilter);
   }
 
   if (!filtered.length) {
-    list.innerHTML = '<div class="empty-state" style="padding:30px"><p>Keine Abfahrten gefunden</p></div>';
+    list.innerHTML = '<div class="empty-state" style="padding:30px"><p>Aktuell keine Abfahrten.<br>Ggf. Ersatzverkehr oder Betriebspause.</p></div>';
     return;
   }
 
-  const now = new Date();
+  const now = Date.now();
 
   list.innerHTML = filtered.map(d => {
-    const lineClass = lineColorClass(d.line.name);
-    const hasIcon = d.line.symbol && d.line.symbol.endsWith('.svg');
-    const lineHtml = hasIcon
-      ? `<img src="${ICON_BASE}${d.line.symbol}" alt="${d.line.number}" onerror="this.outerHTML='<span class=\\'line-badge ${lineClass}\\'>${d.line.number}</span>'">`
-      : `<span class="line-badge ${lineClass}">${d.line.number}</span>`;
+    const lineClass = lineColorClass(d.type);
+    const lineHtml = `<span class="line-badge ${lineClass}">${esc(d.label)}</span>`;
 
-    const planned = d.departurePlanned;
-    const live = d.departureLive || planned;
-    const isDelayed = !d.inTime && live !== planned;
+    const isDelayed = d.realtime && d.delay > 0 && !d.cancelled;
+    const liveStr = fmtTime(d.live);
+    const plannedStr = fmtTime(d.planned);
 
     // Calculate minutes until departure
-    const [lh, lm] = live.split(':').map(Number);
-    const depDate = parseDepDate(d.departureDate, lh, lm);
-    const diffMs = depDate - now;
-    const diffMin = Math.round(diffMs / 60000);
+    const diffMin = Math.round((d.live - now) / 60000);
 
     let minText = '';
     let minClass = '';
-    if (diffMin <= 0) {
+    if (d.cancelled) {
+      minText = 'entfällt';
+      minClass = 'delayed';
+    } else if (diffMin <= 0) {
       minText = 'jetzt';
       minClass = 'on-time';
     } else if (diffMin <= 60) {
@@ -766,18 +798,18 @@ function renderDepartures() {
       minClass = isDelayed ? 'delayed' : 'on-time';
     }
 
-    const trackText = d.track ? d.track.replace('U-Bahn ', '') : '';
+    const trackText = d.platform ? `Gleis ${esc(d.platform)}` : '';
 
     return `
       <div class="dep-item">
         <div class="dep-line">${lineHtml}</div>
         <div class="dep-info">
-          <div class="dep-direction">${d.direction}</div>
+          <div class="dep-direction">${esc(d.destination)}</div>
           ${trackText ? `<div class="dep-track">${trackText}</div>` : ''}
         </div>
         <div class="dep-time">
-          <span class="dep-time-main ${isDelayed ? 'delayed' : ''}">${live}</span>
-          ${isDelayed ? `<span class="dep-time-planned">${planned}</span>` : ''}
+          <span class="dep-time-main ${(d.cancelled || isDelayed) ? 'delayed' : ''}">${d.cancelled ? '—' : liveStr}</span>
+          ${(isDelayed && !d.cancelled) ? `<span class="dep-time-planned">${plannedStr}</span>` : ''}
           <span class="dep-time-min ${minClass}">${minText}</span>
         </div>
       </div>
@@ -785,25 +817,22 @@ function renderDepartures() {
   }).join('');
 }
 
-function parseDepDate(dateStr, h, m) {
-  // dateStr = "20260207"
-  const y = parseInt(dateStr.substring(0, 4));
-  const mo = parseInt(dateStr.substring(4, 6)) - 1;
-  const da = parseInt(dateStr.substring(6, 8));
-  return new Date(y, mo, da, h, m, 0);
+function fmtTime(ms) {
+  return new Date(ms).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
 }
 
-function classifyLine(name) {
-  const n = name.toLowerCase();
-  if (n.includes('s-bahn')) return 'sbahn';
-  if (n.includes('u-bahn')) return 'ubahn';
-  if (n.includes('bus')) return 'bus';
-  if (n.includes('tram') || n.includes('straßenbahn')) return 'tram';
-  return 'other';
+function classifyType(t) {
+  switch (t) {
+    case 'SBAHN': return 'sbahn';
+    case 'UBAHN': return 'ubahn';
+    case 'TRAM': return 'tram';
+    default:
+      return (t && t.includes('BUS')) ? 'bus' : 'other';
+  }
 }
 
-function lineColorClass(name) {
-  switch (classifyLine(name)) {
+function lineColorClass(t) {
+  switch (classifyType(t)) {
     case 'sbahn': return 'line-sbahn';
     case 'ubahn': return 'line-ubahn';
     case 'bus': return 'line-bus';
@@ -814,7 +843,7 @@ function lineColorClass(name) {
 
 // --- Filter Tabs ---
 function renderFilterTabs() {
-  const types = new Set(departures.map(d => classifyLine(d.line.name)));
+  const types = new Set(departures.map(d => classifyType(d.type)));
   const container = document.getElementById('filterTabs');
 
   if (types.size <= 1) {
@@ -854,11 +883,11 @@ function renderNotifications(deps) {
   const notifs = [];
 
   for (const d of deps) {
-    for (const n of (d.notifications || [])) {
-      const key = n.text.substring(0, 60);
-      if (!seen.has(key)) {
+    for (const msg of (d.messages || [])) {
+      const key = msg.substring(0, 60);
+      if (msg && !seen.has(key)) {
         seen.add(key);
-        notifs.push(n);
+        notifs.push(msg);
       }
     }
   }
@@ -868,10 +897,10 @@ function renderNotifications(deps) {
     return;
   }
 
-  container.innerHTML = notifs.slice(0, 3).map((n, i) => `
+  container.innerHTML = notifs.slice(0, 3).map(msg => `
     <div class="notif-banner" onclick="this.querySelector('.notif-text').classList.toggle('collapsed')">
       <span class="notif-icon">⚠️</span>
-      <span class="notif-text collapsed">${n.text}</span>
+      <span class="notif-text collapsed">${esc(msg)}</span>
     </div>
   `).join('');
 }
@@ -897,8 +926,9 @@ function init() {
   // Pre-seed favorites on first visit
   if (!localStorage.getItem('mvv-favs')) {
     saveFavorites([
-      { id: 'de:09162:1730', name: 'München, Neuaubing' },
-      { id: 'de:09162:8', name: 'München, Donnersbergerbrücke' }
+      { id: 'de:09162:2', name: 'München, Marienplatz' },
+      { id: 'de:09162:1', name: 'München, Hauptbahnhof' },
+      { id: 'de:09162:1730', name: 'München, Neuaubing' }
     ]);
   }
 

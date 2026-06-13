@@ -1,4 +1,4 @@
-const CACHE = 'mvv-v1';
+const CACHE = 'mvv-v2';
 const ASSETS = ['./index.html', './manifest.json'];
 
 self.addEventListener('install', e => {
@@ -17,7 +17,7 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
   // API calls: network-first
-  if (url.hostname === 'www.mvv-muenchen.de') {
+  if (url.hostname === 'www.mvg.de') {
     e.respondWith(
       fetch(e.request)
         .then(res => {
